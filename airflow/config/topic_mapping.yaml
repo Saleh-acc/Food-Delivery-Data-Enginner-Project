@@ -1,0 +1,18 @@
+# conf/topic_mapping.yaml
+topic_to_table:
+  cdc.public.orders: lake.bronze.orders
+  cdc.public.order_items: lake.bronze.order_items
+  cdc.public.payments: lake.bronze.payments
+  cdc.public.order_status_events: lake.bronze.order_status_events
+  cdc.public.reviews: lake.bronze.reviews
+  cdc.public.drivers: lake.bronze.drivers
+  cdc.public.menu_items: lake.bronze.menu_items
+
+kafka:
+  bootstrap_servers: kafka:9092,kafka-2:9092
+  subscribe_pattern: "cdc\\.public\\..*"
+
+streaming:
+  trigger_interval: "40 seconds"
+  checkpoint_location: "s3a://lake/spark/checkpoints/bronze_writer"
+  starting_offsets: earliest

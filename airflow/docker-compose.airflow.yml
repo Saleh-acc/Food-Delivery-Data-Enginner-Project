@@ -1,0 +1,230 @@
+---
+# Shared config every Airflow service reuses via the *airflow-common anchor.
+x-airflow-common:
+  &airflow-common
+  build: .
+  image: airflow-lakehouse:3.2.2
+  environment:
+    &airflow-common-env
+    AIRFLOW__SECRETS__BACKEND: airflow.providers.hashicorp.secrets.vault.VaultBackend
+    AIRFLOW__SECRETS__BACKEND_KWARGS: '{"url":"http://vault:8200","token":"${VAULT_TOKEN}","variables_path":"variables","mount_point":"secret"}'
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-source:5432/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql+psycopg2://airflow:airflow@postgres-source:5432/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    PYTHONPATH: /opt/airflow
+    AIRFLOW__LOGGING__DELETE_LOCAL_LOGS: "True"
+    # Workers/dag-processor reach the metadata DB only through this API, never directly:
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    SPARK_CONF_DIR: /opt/spark/conf
+    # MUST be identical across all services or worker->API auth fails:
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./config/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    - ./plugins:/opt/airflow/plugins
+    - ./spark_jobs:/opt/airflow/spark_jobs
+    - ./config/keystore.jks:/opt/spark/secrets/ssl/keystore.jks:ro
+    - /var/run/docker.sock:/var/run/docker.sock
+    - E:/dev-backup/FoodDeliveryPipeline/dbt-spark/lakehouse_gold:/opt/airflow/dbt/lakehouse_gold
+    - E:/dev-backup/FoodDeliveryPipeline/dbt-spark/profiles:/opt/airflow/dbt/profiles
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+      - default
+      - lakehouse-core-net
+      - spark-network
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    # postgres:
+    #   condition: service_healthy
+
+services:
+  # --- State store --- use the cdc postgres
+  # postgres:
+  #   image: postgres:16
+  #   environment:
+  #     POSTGRES_USER: airflow
+  #     POSTGRES_PASSWORD: airflow
+  #     POSTGRES_DB: airflow
+  #   volumes:
+  #     - postgres-db-volume:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD", "pg_isready", "-U", "airflow"]
+  #     interval: 10s
+  #     retries: 5
+  #     start_period: 5s
+  #   restart: always
+
+  # --- Celery broker ---
+  redis:
+    image: redis:7.2
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+
+  # --- UI + Task Execution API ---
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8282:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --- The brain ---
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --- Parses DAG files ---
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    # environment:
+    #   PYTHONPATH: "/opt/spark/python:/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-0.10.9.7-src.zip:/opt/airflow/spark_jobs:/opt/airflow"
+
+    dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --- Runs tasks (and spark-submit). Joined to BOTH networks. ---
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    healthcheck:
+      test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      # PYTHONPATH: "/opt/spark/python:/opt/spark/python/lib/pyspark.zip:/opt/spark/python/lib/py4j-0.10.9.7-src.zip:/opt/airflow/spark_jobs:/opt/airflow"
+
+      <<: *airflow-common-env
+
+      DUMB_INIT_SETSID: "0"
+
+      
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --- Runs deferred / event-driven triggers ---
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # --- One-shot: migrate DB + create admin user, then exits ---
+  airflow-init:
+    <<: *airflow-common
+    command: version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+  vault:
+    image: hashicorp/vault:1.18
+    container_name: vault
+    hostname: vault
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_TOKEN}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: "http://127.0.0.1:8200"
+      VAULT_API_ADDR: "http://0.0.0.0:8200"
+    cap_add:
+      - IPC_LOCK
+    command: vault server -config=/vault/config/vault.hcl
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - vault-data:/var/lib/misc/data
+      - ./vault/config:/vault/config
+    networks:
+      - default
+
+
+
+volumes:
+ # postgres-db-volume:
+  vault-data:
+
+networks:
+  default:        # private network for the Airflow services + postgres + redis
+   driver: bridge
+  lakehouse-core-net:
+    external: true
+  spark-network:
+    external: true
+    

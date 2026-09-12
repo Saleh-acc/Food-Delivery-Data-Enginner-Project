@@ -1,0 +1,12 @@
+lakehouse_gold:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: thrift
+      schema: gold
+      catalog: lake
+      host: spark-master
+      port: 10000
+      threads: 1
+     

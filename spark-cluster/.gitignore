@@ -1,0 +1,7 @@
+secrets/
+*.jks
+*.p12
+*.pem
+*.key
+logs/
+*.inprogress

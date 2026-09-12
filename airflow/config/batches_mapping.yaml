@@ -1,0 +1,10 @@
+postgress:
+  "jdbc_url": "jdbc:postgresql://postgres-source:5432/master_db"
+  "jdbc_properties": 
+     - "user": "admin"
+     - "password": "admin"
+     - "driver": "org.postgresql.Driver"    
+
+
+bucket:
+  "bronze-layer": "lake.bronze"

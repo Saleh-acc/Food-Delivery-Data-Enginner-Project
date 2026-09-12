@@ -1,0 +1,180 @@
+services:
+
+  spark-master:
+    build: 
+      context: .
+      dockerfile: dockerfile
+    image: my-spark:3.5.3
+    container_name: spark-master
+    hostname: spark-master
+    restart: unless-stopped
+    # command: >
+    #   bash -c "
+    #     /opt/spark/sbin/start-thriftserver.sh --master spark://spark-master:7077 
+      
+    #   "
+    #  Apache Spark image. It does NOT automatically start as a master or worker, so you must specify the entrypoint to define each container's role.
+    #entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master" ]
+    #command: entrypoint["/run_threftserver.sh"]
+    environment:
+      SPARK_SERVICE_NAME: Master
+      SPARK_MASTER_HOST: spark-master
+      SPARK_LOCAL_IP: "0.0.0.0"
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+      SPARK_LOCAL_DIRS: /opt/spark/tmp
+    tmpfs:
+      - /opt/spark/tmp:size=512m,uid=185,gid=185
+    ports:
+      - "8080:8080"
+      - "8480:8480"  # HTTPS Master UI
+      - "7077:7077"
+    volumes:
+      - ./apps:/opt/spark-apps
+      - ./logs:/opt/spark/logs
+    #  - ./conf/start-thriftsrever.sh:/opt/spark/sbin/start-thriftsrever.sh
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro # Base on the spark-default.conf, `:ro` means read-only.
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./secrets/ssl:/opt/spark/secrets/ssl:ro # read only becuse the sll is sensitive
+      
+     # - ./conf/spark-startup.sh:/spark-startup.sh
+
+    networks:
+      - spark-network
+      - lakehouse-core-net
+
+  spark-worker-1:
+    image: my-spark:3.5.3
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    restart: unless-stopped
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_SERVICE_NAME: Worker-1
+      SPARK_MASTER: spark://spark-master:7077
+    #  SPARK_LOCAL_IP: 0.0.0.0
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "3g"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+      SPARK_LOCAL_DIRS: /opt/spark/tmp
+      # SPARK_WORKER_DIR: /opt/spark/work
+    tmpfs:
+      - /opt/spark/tmp:size=2g,uid=185,gid=185
+    ports:
+      - "127.0.0.1:8081:8081"   # Worker UI — localhost ONLY
+    volumes:
+      - ./apps:/opt/spark-apps
+      - ./logs:/opt/spark/logs
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./secrets/ssl:/opt/spark/secrets/ssl:ro
+#      - spark-worker-1-tmp:/opt/spark/tmp
+     # - ./conf/spark-startup.sh:/spark-startup.sh
+
+
+    depends_on:
+      - spark-master
+       
+    networks:
+      - spark-network
+      - lakehouse-core-net
+
+  spark-worker-2:
+    image: my-spark:3.5.3
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    restart: unless-stopped
+    
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "--work-dir", "/opt/spark/work",  "spark://spark-master:7077"] #  "bash", "-c","/spark-startup.sh"
+    environment:
+      SPARK_SERVICE_NAME: Worker-2
+      SPARK_MASTER: spark://spark-master:7077
+     # SPARK_LOCAL_IP: 0.0.0.0
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "3g"
+      SPARK_WORKER_WEBUI_PORT: "8082"
+      SPARK_LOCAL_DIRS: /opt/spark/tmp
+      # SPARK_WORKER_DIR: /opt/spark/work
+    tmpfs:
+      - /opt/spark/tmp:size=2g,uid=185,gid=185
+    ports:
+      - "127.0.0.1:8082:8082"   # Worker UI — localhost ONLY
+    volumes:
+      - ./apps:/opt/spark-apps
+      - ./logs:/opt/spark/logs
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./secrets/ssl:/opt/spark/secrets/ssl:ro
+     # - ./conf/spark-startup.sh:/spark-startup.sh
+
+    depends_on:
+      - spark-master
+    networks:
+      - spark-network
+      - lakehouse-core-net
+  spark-history:
+    image: my-spark:3.5.3
+    container_name: spark-history
+    hostname: spark-history
+    entrypoint: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    environment:
+      SPARK_SERVICE_NAME: Worker-3
+      SPARK_HISTORY_OPTS: >-  
+        -Dspark.history.ui.port=18080
+        -Dspark.history.fs.logDirectory=s3a://lake/spark-events
+        -Dspark.history.retainedApplications=50
+        -Dspark.history.fs.cleaner.maxAge=1d
+        -Dspark.history.fs.cleaner.enabled=true
+        -Dspark.history.ui.acls.enable=true
+        -Dspark.history.ui.admin.acls=spark
+        -Dspark.history.fs.inProgressOptimization.enabled=true
+        -Dspark.history.fs.update.interval=10s
+    ports:
+      - "18080:18080"
+      - "18480:18480" # HTTPS History Server UI
+    volumes:
+      - ./logs:/opt/spark/logs
+      - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./conf/log4j2.properties:/opt/spark/conf/log4j2.properties:ro
+      - ./secrets/ssl:/opt/spark/secrets/ssl:ro
+     # - ./conf/spark-startup.sh:/spark-startup.sh
+    
+
+
+    networks:
+      - spark-network
+      - lakehouse-core-net
+
+  jupyter:
+    build: 
+      context: .
+      dockerfile: dockerfile.jupyter
+    image: my-jupyter:3.5.3
+    container_name: jupyter
+    hostname: jupyter
+    depends_on:
+      - spark-master
+    ports:
+      - "8888:8888"
+    networks:
+      - spark-network
+      - lakehouse-core-net
+    volumes:
+        - ./apps:/opt/spark-notebooks/apps
+        - spark_data:/opt/spark-data
+        - ./conf/spark-defaults.conf:/usr/local/spark/conf/spark-defaults.conf:ro
+        - ./logs:/opt/spark/logs
+        - ./conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+        - ./conf/log4j2.properties:/usr/local/spark/conf/log4j2.properties:ro
+        - ./secrets/ssl:/usr/local/spark/secrets/ssl:ro
+
+
+networks:
+  spark-network:
+     name: spark-network
+     external: true
+
+  lakehouse-core-net:
+    external: true
+volumes:
+  spark_data:

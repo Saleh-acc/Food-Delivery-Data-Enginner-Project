@@ -1,0 +1,100 @@
+# ============================================================
+# DBT DRIVER-SIDE SPARK CONFIG
+# This runs inside the dbt container (client/driver mode)
+# ============================================================
+
+# ----------------------------
+# MASTER CONNECTION
+# ----------------------------
+spark.master                                spark://spark-master:7077
+
+# ----------------------------
+# DRIVER RESOURCES
+# dbt's in-process Spark IS the driver
+# ----------------------------
+spark.driver.memory                         1g
+spark.driver.memoryOverhead                 256m
+
+# ----------------------------
+# PARALLELISM
+# Match your cluster so shuffle partitions align
+# ----------------------------
+spark.default.parallelism                   6
+spark.sql.shuffle.partitions                6
+# if a table is smaller than 100MB, send a full copy to every executor instead of shuffling.
+spark.sql.autoBroadcastJoinThreshold 104857600
+spark.sql.shuffle.partitions 200
+
+# Increase the timeout to not cancel if the data is huge
+spark.network.timeout 600s
+spark.shuffle.io.connectionTimeout 600s
+# ----------------------------
+# SERIALIZATION
+# ----------------------------
+spark.serializer                            org.apache.spark.serializer.JavaSerializer
+spark.kryoserializer.buffer.max             128m
+
+# ----------------------------
+# ADAPTIVE QUERY EXECUTION
+# ----------------------------
+spark.sql.adaptive.enabled                          true
+spark.sql.adaptive.coalescePartitions.enabled       true
+spark.sql.adaptive.skewJoin.enabled                 true
+
+# ----------------------------
+# AUTHENTICATION
+# Must match the cluster secret exactly
+# ----------------------------
+spark.authenticate                          true
+spark.authenticate.secret                   __SPARK_AUTH_SECRET
+
+# ----------------------------
+# SSL
+# Must match the cluster SSL config exactly
+# ----------------------------
+spark.ssl.enabled                           true
+spark.ssl.keyStore                          /opt/spark/secrets/ssl/keystore.jks
+spark.ssl.keyStorePassword                  __SPARK_STORE_PASS__
+spark.ssl.keyPassword                       __SPARK_STORE_PASS__
+spark.ssl.protocol                          TLSv1.2
+
+# ----------------------------
+# ICEBERG
+# ----------------------------
+spark.sql.extensions                        org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+spark.sql.catalog.lake                      org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.lake.type                 hadoop
+spark.sql.catalog.lake.warehouse            s3a://lake/warehouse
+spark.sql.defaultCatalog                    lake
+
+# ----------------------------
+# MINIO / S3A
+# ----------------------------
+spark.hadoop.fs.s3a.endpoint                http://minio-lb:9000
+spark.hadoop.fs.s3a.access.key          __MINIO_ACCESS_KEY__
+spark.hadoop.fs.s3a.secret.key          __MINIO_SECRET_KEY__
+spark.hadoop.fs.s3a.aws.credentials.provider org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+spark.hadoop.fs.s3a.path.style.access       true
+spark.hadoop.fs.s3a.connection.ssl.enabled  false
+spark.hadoop.fs.s3a.impl                    org.apache.hadoop.fs.s3a.S3AFileSystem
+spark.hadoop.fs.s3a.fast.upload             true
+spark.hadoop.fs.s3a.connection.maximum      100
+
+# ----------------------------
+# JARS
+# Same versions your cluster already uses
+# ----------------------------
+spark.jars.packages org.postgresql:postgresql:42.6.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+
+
+
+# ----------------------------
+# EVENT LOGGING (for History Server)
+# ----------------------------
+spark.eventLog.enabled              true
+# spark.eventLog.dir                  /opt/spark/logs
+# spark.history.fs.logDirectory       /opt/spark/logs
+spark.eventLog.dir                  s3a://lake/spark-events
+spark.history.fs.logDirectory       s3a://lake/spark-events
+spark.history.fs.inProgressOptimization.enabled    true
+spark.history.fs.update.interval                   10s

@@ -1,0 +1,189 @@
+# ============================================================
+# SPARK DEFAULTS CONFIGURATION
+# Cluster: 1 Master + 2 Workers | 2 cores + 3GB RAM per worker
+# ============================================================
+
+# Total worker RAM available : 2 workers × 3g = 6g
+# Executors per worker       : 1 (best for learning clusters)
+# spark.executor.memory      : 3g × 0.75 overhead factor = ~2g (safe usable)
+# spark.executor.cores       : 2 cores ÷ 2 executors = 1 core each
+# spark.driver.memory        : 1g (driver runs on master, which has its own 1g daemon budget)
+
+# ----------------------------
+# MASTER CONNECTION
+# ----------------------------
+spark.master                        spark://spark-master:7077
+
+# ----------------------------
+# EXECUTOR RESOURCES
+# Calculation:
+#   3072 MB worker RAM
+#   - 384 MB JVM/OS overhead (memoryOverhead)
+#   = 2688 MB usable → 2g (conservative, stable)
+# ----------------------------
+spark.executor.memory                   2g
+spark.executor.memoryOverhead           384m
+spark.executor.cores                    1
+spark.driver.memory                     1g
+spark.driver.memoryOverhead             256m
+
+# ----------------------------
+# MEMORY FRACTIONS
+# Tuned for mixed join + transform workload:
+#   80% of 2g = 1.6 GB for Spark internals
+#   50/50 split between execution and storage
+# ----------------------------
+spark.memory.fraction                   0.8
+spark.memory.storageFraction            0.5
+
+# ----------------------------
+# PARALLELISM & SHUFFLE
+# Formula for mixed workloads: 3× total executor cores
+#   3 × 2 cores = 6 partitions
+# Gives shuffle operations enough parallelism
+# without creating tiny tasks
+# ----------------------------
+spark.default.parallelism               6
+spark.sql.shuffle.partitions            6
+
+# ----------------------------
+# JOIN OPTIMIZATION
+# Tables smaller than 20 MB are broadcast to all
+# executors automatically — eliminates shuffle entirely
+# for small-large table joins (very common in ETL)
+# ----------------------------
+spark.sql.autoBroadcastJoinThreshold    20971520
+# if a table is smaller than 100MB, send a full copy to every executor instead of shuffling.
+
+
+# ----------------------------
+# SERIALIZATION (performance)
+# ----------------------------
+spark.serializer                    org.apache.spark.serializer.KryoSerializer
+spark.kryoserializer.buffer.max     128m
+
+# ----------------------------
+# SHUFFLE BEHAVIOR
+# compress = saves disk/network during shuffles
+# bypassMergeThreshold: if partitions <= 6, use
+#   simpler shuffle path (faster for our partition count)
+# ----------------------------
+spark.shuffle.compress                  true
+spark.shuffle.spill.compress            true
+spark.shuffle.sort.bypassMergeThreshold 6
+
+# ----------------------------
+# ADAPTIVE QUERY EXECUTION (AQE)
+# Spark 3.x feature — dynamically optimizes joins
+# and coalesces shuffle partitions at runtime
+# based on actual data statistics
+# ----------------------------
+spark.sql.adaptive.enabled                          true
+spark.sql.adaptive.coalescePartitions.enabled       true
+spark.sql.adaptive.coalescePartitions.minPartitionSize 64MB
+spark.sql.adaptive.skewJoin.enabled                 true
+
+# ----------------------------
+# EVENT LOGGING (for History Server)
+# ----------------------------
+spark.eventLog.enabled false
+# spark.eventLog.dir                  /opt/spark/logs
+# spark.history.fs.logDirectory       /opt/spark/logs
+spark.eventLog.dir                  s3a://lake/spark-events
+spark.history.fs.logDirectory       s3a://lake/spark-events
+spark.history.fs.inProgressOptimization.enabled    true
+spark.history.fs.update.interval                   10s
+
+
+# ----------------------------
+# NETWORK TIMEOUTS
+# ----------------------------
+# Increase the timeout to not cancel if the data is huge
+spark.network.timeout 600s
+spark.shuffle.io.connectionTimeout 600s
+spark.executor.heartbeatInterval    20s
+
+
+# ----------------------------
+# AUTHENTICATION (Layer 2)
+# ----------------------------
+spark.authenticate                      true
+spark.authenticate.secret                   __SPARK_AUTH_SECRET
+
+# ----------------------------
+# SSL / ENCRYPTION (Layer 3)
+# Dev: self-signed cert | Prod: CA-signed certificate
+# ----------------------------
+spark.ssl.enabled                           true
+spark.ssl.keyStore                          /opt/spark/secrets/ssl/keystore.jks
+spark.ssl.keyStorePassword                  __SPARK_STORE_PASS__
+spark.ssl.keyPassword                       __SPARK_STORE_PASS__
+spark.ssl.protocol                          TLSv1.2
+
+# ----------------------------
+# UI SECURITY (Layer 4)
+# ----------------------------
+spark.ui.killEnabled                        false
+spark.acls.enable                           true
+spark.admin.acls                            spark
+spark.ui.view.acls                          spark
+spark.modify.acls                           spark
+
+
+
+# ----------------------------
+# Datalake (Layer 5)
+# ----------------------------
+# ─── Iceberg SQL extensions ────────────────────────────────────────
+# Adds Iceberg-specific syntax to Spark SQL:
+#   - CALL system.rewrite_data_files(...) for compaction
+#   - CALL system.expire_snapshots(...) for cleanup
+#   - MERGE INTO ... WHEN MATCHED ... for upserts (SCD2)
+#   - WRITE ORDERED BY / WRITE DISTRIBUTED BY
+# Without this line, those SQL commands raise "syntax error" in Spark.
+spark.sql.extensions                   org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+
+# ─── Iceberg catalog "lake" ────────────────────────────────────────
+# Defines a catalog named "lake" that Spark can query as: lake.<namespace>.<table>
+# Catalog type "hadoop" = metadata stored as files in the warehouse path itself.
+# No external catalog service needed.
+# s3a://lake/warehouse - where the catalog lives.
+spark.sql.catalog.lake                 org.apache.iceberg.spark.SparkCatalog
+spark.sql.catalog.lake.type            hive
+spark.sql.catalog.lake.uri             thrift://hive-metastore:9083
+spark.sql.catalog.lake.warehouse       s3a://lake/warehouse
+
+
+spark.hadoop.fs.s3a.endpoint           http://minio-lb:9000
+spark.hadoop.fs.s3a.access.key          __MINIO_ACCESS_KEY__
+spark.hadoop.fs.s3a.secret.key          __MINIO_SECRET_KEY__
+# Tells S3A how to find credentials. Options:
+
+spark.hadoop.fs.s3a.aws.credentials.provider  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+
+# Path-style addressing: minio1:9000/lake/...  (vs virtual-host style: lake.minio1:9000/...)
+# MinIO requires path-style. Real AWS S3 supports both.
+# Two addressing styles in S3:
+# Virtual-host: https://bucket.s3.amazonaws.com/key (DNS-based)
+# Path-style: https://s3.amazonaws.com/bucket/key (bucket in URL)
+# MinIO only supports path-style. Without this, Spark tries virtual-host, MinIO doesn't recognize the request, you get "BUCKET_NOT_FOUND" errors.
+spark.hadoop.fs.s3a.path.style.access         true
+
+# Disable SSL — we don't have certs in this setup.
+spark.hadoop.fs.s3a.connection.ssl.enabled    false
+
+# Implementation class for the s3a:// scheme.
+spark.hadoop.fs.s3a.impl                      org.apache.hadoop.fs.s3a.S3AFileSystem
+
+# Per-table directories: required for Iceberg.
+# Without this, S3A treats paths like directories in unhelpful ways.
+spark.hadoop.fs.s3a.fast.upload                true
+spark.hadoop.fs.s3a.connection.maximum         100
+
+# Kafka connector for Spark Structured Streaming
+#spark.jars.packages org.postgresql:postgresql:42.6.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1,org.apache.iceberg:iceberg-aws-bundle:1.6.1,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262
+
+
+
+spark.driver.extraJavaOptions  -Djava.net.preferIPv4Stack=true
+spark.executor.extraJavaOptions  -Djava.net.preferIPv4Stack=true

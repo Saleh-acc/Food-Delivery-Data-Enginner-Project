@@ -1,0 +1,383 @@
+FROM apache/spark:3.5.3-python3
+
+USER root
+
+# =========================================================
+# SYSTEM DEPENDENCIES + PYTHON 3.8 BASE
+# =========================================================
+# WHY: The base apache/spark:3.5.3 image is minimal — it ships
+# only what Spark needs to run JVM workloads. We need additional
+# system tools for:
+#
+# - python3-pip / python3-dev: allow installing Python packages
+#   and building C extensions under the default Python 3.8
+# - build-essential: C compiler toolchain, required by some pip
+#   packages that compile native extensions at install time
+# - vim / nano: editors for debugging inside running containers
+# - bash-completion: tab-completion in interactive shells,
+#   makes container debugging significantly less painful
+# - software-properties-common: provides add-apt-repository,
+#   needed for adding external PPAs (used in later layers)
+# - curl: used in every subsequent RUN block to download jars
+#   and binaries from remote repositories
+#
+# pyyaml: used by our PySpark jobs to read YAML config files
+# tqdm: used by our pipeline scripts for progress bars
+#
+# NOTE: We install these under Python 3.8 (the system default).
+# Jupyter will also use Python 3.8. PySpark executor workers
+# use Python 3.12 (installed below) — these are intentionally
+# separate Python environments on the same image.
+# =========================================================
+RUN apt-get update && \
+    apt-get install -y \
+        python3-pip python3-dev \
+        build-essential vim nano bash-completion \
+        software-properties-common \
+        curl \
+        netcat-openbsd && \
+    python3 -m pip install --no-cache-dir pyyaml tqdm && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# =========================================================
+# SPARK STARTUP BANNER SCRIPT
+# =========================================================
+# WHY: This script runs before the Spark process starts and
+# prints a diagnostic banner showing which service is starting
+# (Master, Worker-1, Worker-2, History), the hostname, and
+# the current time. Purely operational convenience — makes
+# it much faster to identify which container's logs you're
+# reading when debugging a multi-container cluster.
+#
+# The script is driven by SPARK_SERVICE_NAME env var set in
+# docker-compose.spark.yml per service, e.g.:
+#   SPARK_SERVICE_NAME=Master
+#   SPARK_SERVICE_NAME=Worker-1
+# =========================================================
+RUN mkdir -p /home/spark/.ivy2/cache /home/spark/.ivy2/jars && \
+    chown -R spark:spark /home/spark/.ivy2 && \
+    chmod -R 777 /home/spark/.ivy2
+
+
+COPY conf/spark-startup.sh /spark-startup.sh
+RUN chmod 755 /spark-startup.sh
+
+# =========================================================
+# PYTHON 3.12 — match driver (Airflow worker) Python version
+# =========================================================
+# WHY: PySpark enforces that the Python version on the executor
+# side exactly matches the driver side. Our Airflow worker runs
+# Python 3.12 (the version shipped in the apache/airflow base
+# image). Without matching Python on the executors, every Spark
+# task fails with:
+#   PYTHON_VERSION_MISMATCH: Python in worker has different
+#   version (3, 8) than that in driver 3.12
+#
+# WHY NOT the system package manager (apt):
+# apache/spark:3.5.3 is a Ubuntu 20.04 / Debian hybrid image.
+# Neither Ubuntu 20.04's default repos nor Debian's ship
+# Python 3.12. The deadsnakes PPA approach failed because
+# add-apt-repository requires Ubuntu-specific tooling that
+# isn't present in this hybrid image.
+#
+# WHY python-build-standalone:
+# Gregory Szorc's python-build-standalone project provides
+# pre-compiled, self-contained Python binaries that work on
+# any Linux distribution regardless of the distro's package
+# manager. No compilation, no PPAs, no distro-specific quirks.
+# The binary is ~30MB and installs cleanly by extracting a
+# tarball and symlinking the binary into /usr/local/bin.
+#
+# IMPORTANT — what we deliberately do NOT do:
+# We do NOT change the default python3 symlink. That would
+# break Jupyter, which expects python3 = Python 3.8.
+# Instead, PYSPARK_PYTHON=python3.12 tells only the Spark
+# executor worker process which Python binary to use.
+# Everything else (Jupyter, system scripts) keeps Python 3.8.
+#
+# pyyaml + tqdm are reinstalled under 3.12 because pip packages
+# are version-specific — a package installed under 3.8 is not
+# available to 3.12's interpreter. Each Python version has its
+# own isolated site-packages directory.
+# =========================================================
+RUN apt-get update && \
+    apt-get install -y xz-utils && \
+    curl -fsSL "https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.12.1+20240107-x86_64-unknown-linux-gnu-install_only.tar.gz" \
+        -o /tmp/python312.tar.gz && \
+    tar -xf /tmp/python312.tar.gz -C /usr/local/ && \
+    ln -sf /usr/local/python/bin/python3.12 /usr/local/bin/python3.12 && \
+    ln -sf /usr/local/python/bin/pip3.12 /usr/local/bin/pip3.12 && \
+    python3.12 -m pip install --no-cache-dir pyyaml tqdm && \
+    rm /tmp/python312.tar.gz && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Tell PySpark executor workers to use Python 3.12.
+# This env var is read by CoarseGrainedExecutorBackend when
+# it spawns the Python worker subprocess for each task.
+# python3 still points to 3.8 so Jupyter is unaffected.
+ENV PYSPARK_PYTHON=python3.12
+
+# =========================================================
+# KAFKA + SPARK STREAMING DEPENDENCIES
+# =========================================================
+# WHY: Spark does not ship Kafka support by default. These JARs
+# must be present on every node (master + workers) so that both
+# the driver and executors can read/write Kafka topics using
+# Spark Structured Streaming.
+#
+# Baking jars into the image (rather than using spark.jars.packages
+# for dynamic Ivy resolution) is the production-correct approach:
+# - Guarantees identical jar versions across every cluster node
+# - Eliminates per-job download latency (~30s saved per run)
+# - Prevents version drift if Maven Central serves different
+#   artifacts at different times
+#
+# Components:
+# - spark-sql-kafka-0-10_2.12-3.5.3.jar
+#     The main Spark <-> Kafka connector. Enables:
+#       spark.readStream.format("kafka")
+#       spark.writeStream.format("kafka")
+#     The "0-10" refers to the Kafka consumer API version.
+#     The "2.12" is the Scala binary version Spark was built with.
+#
+# - kafka-clients-3.5.1.jar
+#     The Kafka Java client library used internally by the
+#     connector to communicate with Kafka brokers. Note: this
+#     is intentionally a newer version (3.5.1) than the
+#     spark-sql-kafka connector's transitive dependency (3.4.1)
+#     to get bug fixes and protocol improvements.
+#
+# - commons-pool2-2.11.1.jar
+#     Apache Commons object pooling library. Used by the Kafka
+#     connector to pool and reuse Kafka producer/consumer
+#     connections, reducing overhead for high-frequency writes.
+#
+# - spark-token-provider-kafka-0-10_2.12-3.5.3.jar
+#     Handles Kafka authentication tokens for secured clusters
+#     (SASL/Kerberos). Not strictly required for our plaintext
+#     setup but included to avoid ClassNotFoundException errors
+#     when Spark's internal delegation token framework tries to
+#     load it.
+# =========================================================
+RUN curl -o /opt/spark/jars/spark-sql-kafka-0-10_2.12-3.5.3.jar \
+    https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.3/spark-sql-kafka-0-10_2.12-3.5.3.jar && \
+    curl -o /opt/spark/jars/kafka-clients-3.5.1.jar \
+    https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.5.1/kafka-clients-3.5.1.jar && \
+    curl -o /opt/spark/jars/commons-pool2-2.11.1.jar \
+    https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar && \
+    curl -o /opt/spark/jars/spark-token-provider-kafka-0-10_2.12-3.5.3.jar \
+    https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.3/spark-token-provider-kafka-0-10_2.12-3.5.3.jar
+
+# =========================================================
+# APACHE ICEBERG + AWS DEPENDENCIES
+# =========================================================
+# WHY: Iceberg is our table format for the bronze/silver/gold
+# lakehouse layers. Without these JARs, Spark cannot read or
+# write Iceberg tables — SQL commands like MERGE INTO, CREATE
+# TABLE ... USING iceberg, and CALL system.rewrite_data_files
+# all fail with ClassNotFoundException.
+#
+# These must be baked into the image (not dynamic) for the
+# same reason as Kafka jars — version consistency between
+# driver and executor is critical. We learned this the hard
+# way: driver resolving iceberg 1.5.2 via Ivy while executors
+# had 1.6.1 baked in caused InvalidClassException with
+# mismatched serialVersionUID on Types$NestedField.
+#
+# - iceberg-aws-bundle-1.6.1.jar
+#     Bundles all AWS-related Iceberg integrations:
+#     S3FileIO (reads/writes Iceberg data files via S3A),
+#     AWS Glue catalog support, and AWS SDK shims.
+#     Required even with MinIO (not real AWS) because Iceberg
+#     uses S3-compatible APIs for all object store I/O.
+#
+# - iceberg-spark-runtime-3.5_2.12-1.6.1.jar
+#     The main Iceberg <-> Spark integration runtime. Provides:
+#     - SparkCatalog and HadoopCatalog implementations
+#     - IcebergSparkSessionExtensions (SQL extensions)
+#     - DataFrame reader/writer for Iceberg format
+#     The "3.5" matches our Spark version, "2.12" matches Scala.
+#
+# - hadoop-aws-3.3.4.jar
+#     Adds the s3a:// filesystem driver to Hadoop's filesystem
+#     abstraction layer. Without this, any path starting with
+#     s3a:// raises "No FileSystem for scheme s3a".
+#     Matches Hadoop 3.3.4 which is bundled with Spark 3.5.3.
+#
+# - aws-java-sdk-bundle-1.12.262.jar
+#     The AWS Java SDK, bundled as a single fat jar to avoid
+#     dependency conflicts. Provides the actual HTTP client,
+#     credential providers, and S3 protocol implementation
+#     that hadoop-aws delegates to for all S3A operations.
+#     Version 1.12.262 is the tested-compatible version for
+#     hadoop-aws 3.3.4.
+# =========================================================
+RUN curl -o /opt/spark/jars/iceberg-aws-bundle-1.6.1.jar \
+    https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.6.1/iceberg-aws-bundle-1.6.1.jar && \
+    curl -fsSL -o /opt/spark/jars/iceberg-spark-runtime-3.5_2.12-1.6.1.jar \
+    https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar && \
+    curl -fsSL -o /opt/spark/jars/hadoop-aws-3.3.4.jar \
+    https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar && \
+    curl -fsSL -o /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar \
+    https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar \ 
+    curl -fsSL -o /opt/spark/jars/postgresql-42.6.0.jar \
+    https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar && \
+    curl -fsSL -o /opt/spark/jars/spark-sql-kafka-0-10_2.12-3.5.3.jar \
+    https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.3/spark-sql-kafka-0-10_2.12-3.5.3.jar
+
+# =========================================================
+# JUPYTER + DATA SCIENCE TOOLS
+# =========================================================
+# WHY: JupyterLab provides an interactive development
+# environment for building and testing PySpark jobs before
+# promoting them to production Airflow DAGs. This is our
+# primary tool for:
+# - Exploratory data analysis on the lakehouse
+# - Prototyping new pipeline logic interactively
+# - Debugging Spark jobs with live feedback
+# - Running ad-hoc queries against Iceberg tables
+#
+# WHY Python 3.8 for Jupyter (not 3.12):
+# Jupyter uses the system default python3 (3.8). This is
+# intentional — Jupyter's kernel runs in the DRIVER process
+# (inside this container), not on the Spark executors.
+# When you run PySpark inside a notebook, you're running
+# in local mode or submitting to the cluster. In local mode,
+# everything runs in the same Python 3.8 process — no version
+# mismatch possible. When submitting to the cluster,
+# PYSPARK_PYTHON=python3.12 ensures executors use 3.12.
+# Keeping Jupyter on 3.8 avoids touching the CMD line or
+# the kernel configuration.
+#
+# pyspark: installed here gives Jupyter its own PySpark client
+#   that can run jobs in local mode directly inside the notebook
+#   without needing to connect to the cluster — useful for fast
+#   prototyping with small data.
+# numpy / pandas: standard data manipulation libraries for
+#   converting Spark DataFrames to/from Python for visualization
+#   and local computation.
+# ipython: enhanced Python REPL with syntax highlighting,
+#   magic commands (%timeit, %%bash etc.) and better error
+#   formatting.
+#
+# bash_completion is enabled in .bashrc for interactive
+# container shells — tab-completion for spark-submit args,
+# hdfs paths, etc.
+# =========================================================
+# RUN apt-get update && \
+#     pip3 install jupyterlab pyspark numpy pandas ipython && \
+#     apt-get clean && rm -rf /var/lib/apt/lists/* && \
+#     echo ". /usr/share/bash-completion/bash_completion" >> /etc/bash.bashrc
+# RUN pip3 install --no-cache-dir jupyterlab pyspark numpy pandas ipython
+
+
+# =========================================================
+# JUPYTER RUNTIME DIRECTORIES + PERMISSIONS
+# =========================================================
+# WHY: JupyterLab requires several writable directories for
+# runtime state, kernel specs, and configuration. The base
+# image runs as USER spark (non-root), so we must create these
+# directories as root and then chown them to spark before
+# switching users.
+#
+# /home/spark/.local/share/jupyter/runtime:
+#   Jupyter writes kernel connection files here — JSON files
+#   containing the ZMQ socket addresses that connect the
+#   notebook frontend to the kernel backend. Without this
+#   directory, kernel startup fails with PermissionError.
+#
+# /opt/spark-notebooks:
+#   The working directory where notebooks are stored and served.
+#   Set as WORKDIR below so JupyterLab opens to this directory.
+#   This is the path that should be volume-mounted from the host
+#   to persist notebooks across container rebuilds.
+#
+# chown -R spark:spark:
+#   The spark user (UID 185 in this image) must own both
+#   directories. Docker creates directories as root by default,
+#   so without this chown, Jupyter would fail to write kernel
+#   files or save notebooks.
+# =========================================================
+# RUN mkdir -p /home/spark/.local/share/jupyter/runtime && \
+#     mkdir -p /opt/spark-notebooks && \
+#     chown -R spark:spark /home/spark && \
+#     chown -R spark:spark /opt/spark-notebooks
+
+# ENV SHELL=/bin/bash
+
+# Switch to non-root spark user for security.
+# All subsequent RUN, CMD, and ENTRYPOINT instructions
+# execute as this user. Running JupyterLab as root would
+# allow notebooks to modify system files — a security risk
+# even in a local development environment.
+
+# Create work directory with correct permissions BEFORE the volume mounts
+# WHY: Named volumes are created as root by Docker. The spark user (UID 185)
+# can't create subdirectories in a root-owned directory. Setting permissions
+# here ensures the volume inherits correct ownership on first creation.
+RUN mkdir -p /opt/spark/work && \
+    chown -R spark:spark /opt/spark/work && \
+    chmod 755 /opt/spark/work
+
+ENV SPARK_WORKER_DIR=/opt/spark/work
+
+RUN mkdir -p /opt/spark/tmp && chown -R spark:spark /opt/spark/tmp
+COPY ./scripts/create_ddl.sh /opt/spark/sbin/create_ddl.sh
+COPY ./scripts/run_threftserver.sh /opt/spark/sbin/run_threftserver.sh
+RUN chmod +x /opt/spark/sbin/create_ddl.sh /opt/spark/sbin/run_threftserver.sh
+USER spark
+
+# Set the working directory to the notebooks folder.
+# JupyterLab uses this as its root directory — the file
+# browser opens here and all relative paths in notebooks
+# resolve from here.
+# WORKDIR /opt/spark-notebooks
+
+# # =========================================================
+# # JUPYTER ENVIRONMENT DIRECTORIES
+# # =========================================================
+# # WHY: By default, Jupyter looks for runtime/data/config files
+# # in standard XDG directories (~/.local/share/jupyter etc.),
+# # but these may not be writable in all container configurations.
+# # Explicitly redirecting them to /home/spark subdirectories
+# # ensures Jupyter always has a predictable, writable location
+# # for its state files regardless of how the container is run.
+# #
+# # JUPYTER_RUNTIME_DIR: kernel connection files (.json)
+# # JUPYTER_DATA_DIR:    kernelspecs, nbextensions, widgets
+# # JUPYTER_CONFIG_DIR:  jupyter_notebook_config.py and overrides
+# #
+# # All three point into /home/spark which is chowned to the
+# # spark user above, guaranteeing write access.
+# # =========================================================
+# ENV JUPYTER_RUNTIME_DIR=/home/spark/jupyter_runtime
+# ENV JUPYTER_DATA_DIR=/home/spark/jupyter_data
+# ENV JUPYTER_CONFIG_DIR=/home/spark/jupyter_config
+
+# EXPOSE 8888 4040
+
+# # =========================================================
+# # DEFAULT COMMAND — START JUPYTERLAB
+# # =========================================================
+# # WHY the permission fix: when /opt/spark-notebooks is mounted
+# # as a volume from the Docker host (Windows/WSL2), Docker creates
+# # the directory owned by root, not the spark user (UID 185).
+# # The spark user then can't write new notebooks or save changes.
+# # We switch to root temporarily, fix ownership, then drop back
+# # to the spark user to run JupyterLab — keeping the principle
+# # of least privilege for the actual server process.
+# #
+# # --ip=0.0.0.0:      bind to all interfaces so the port is
+# #                    reachable from the Docker host
+# # --port=8888:       standard JupyterLab port, mapped in compose
+# # --no-browser:      don't try to open a browser inside the
+# #                    container (there is no display)
+# # --NotebookApp.token=: disable token auth — acceptable for a
+# #                    local dev environment on a private Docker
+# #                    network; never use in internet-exposed setup
+# # =========================================================
+# USER root
+# CMD ["bash", "-c", "chown -R spark:spark /opt/spark-notebooks && su -s /bin/bash spark -c 'python3 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='"]
+# ENTRYPOINT ["/opt/start-thriftsrever.sh"]
+
+ENTRYPOINT  ["/opt/spark/sbin/run_threftserver.sh"]

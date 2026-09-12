@@ -1,0 +1,23 @@
+services:
+    trino:
+      image: trinodb/trino:476
+      container_name: trino
+      ports:
+        - "8085:8080"
+      volumes:
+        - ./etc/catalog:/etc/trino/catalog:ro
+        - ./etc/jvm.config:/etc/trino/jvm.config:ro
+        - ./etc/config.properties:/etc/trino/config.properties:ro
+      networks:
+        - lakehouse-core-net
+
+      mem_limit: 3g
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+        interval: 30s
+        timeout: 10s
+        retries: 5
+        start_period: 60s
+networks:
+  lakehouse-core-net:
+    external: true

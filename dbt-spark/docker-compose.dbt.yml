@@ -1,0 +1,24 @@
+services:
+  dbt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: dbt
+    hostname: dbt
+    entrypoint: ["tail", "-f", "/dev/null"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+    volumes:
+      - .:/opt/dbt                        # mounts the whole dbt-lakehouse/ folder in
+      - ./conf/spark-defaults.conf:/opt/dbt/conf/spark-defaults.conf:ro
+      - ./profiles/profiles.yml:/opt/dbt/profiles/profiles.yml:ro
+      - ./secrets/ssl:/opt/spark/secrets/ssl:ro
+    networks:
+      - lakehouse-core-net
+
+networks:
+  lakehouse-core-net:
+    external: true
+  spark-network:
+    external: true

@@ -1,0 +1,19 @@
+version: 2
+
+sources: # external tables
+  - name: silver
+    schema: silver
+
+    tables:
+      - name: customers
+      - name: orders
+      - name: order_items
+      - name: order_status_events
+      - name: payments
+      - name: drivers
+      - name: restaurants
+      - name: menu_items
+      - name: zones
+      - name: cities
+      - name: reviews
+      - name: watermarks

@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends default-jre-headless && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir jupyterlab pyspark==3.5.3 numpy pandas ipython
+
+ENV SPARK_CONF_DIR=/opt/spark/conf
+
+RUN useradd -m -s /bin/bash spark
+
+RUN mkdir -p /opt/spark-notebooks && chown -R spark:spark /opt/spark-notebooks
+
+WORKDIR /opt/spark-notebooks
+
+EXPOSE 8888
+
+USER root
+CMD ["bash", "-c", "chown -R spark:spark /opt/spark-notebooks && su -s /bin/bash spark -c 'python3 -m jupyterlab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='"]

@@ -1,0 +1,41 @@
+services:
+  hive-metastore:
+    image: apache/hive:4.0.0
+    container_name: hive-metastore
+    hostname: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+      SERVICE_OPTS: >
+        -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+        -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgres-source:5432/metastore
+        -Djavax.jdo.option.ConnectionUserName=${HIVE_DB_USER}
+        -Djavax.jdo.option.ConnectionPassword=${HIVE_DB_PASSWORD}
+        -Dfs.s3a.endpoint=http://minio-lb:9000
+        -Dfs.s3a.access.key=${MINIO_ROOT_USER}
+        -Dfs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+        -Dfs.s3a.path.style.access=true
+        -Dfs.s3a.connection.ssl.enabled=false
+        -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+        
+    ports:
+      - "9083:9083"
+    volumes:
+    - ./postgresql-jdbc.jar:/opt/hive/lib/postgresql-jdbc.jar
+    - ./hadoop-aws.jar:/opt/hive/lib/hadoop-aws.jar
+    - ./aws-java-sdk-bundle.jar:/opt/hive/lib/aws-java-sdk-bundle.jar
+    - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml
+
+    networks:
+      - lakehouse-core-net
+      - spark-network
+networks:
+    lakehouse-core-net:
+      external: true
+    spark-network:
+      external: true
+        
+# this must be exist to run the hive 
+# CREATE USER hive WITH PASSWORD 'hive'
+# CREATE DATABASE metastore OWNER hive
+# GRANT ALL PRIVILEGES ON DATABASE metastore TO hive;

@@ -1,0 +1,30 @@
+
+{
+  "name": "postgres-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector", 
+    "snapshot.mode": "initial",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "cdc_debezium",
+    "database.password": "debezium123",
+    "database.dbname": "master_db",
+
+    "database.server.name": "pgserver1",
+
+    "plugin.name": "pgoutput",
+
+    "slot.name": "debezium_slot",
+    "publication.name": "dbz_publication",
+
+    "table.include.list": "public.orders, public.order_status_events, public.payments, public.order_items,  public.menu_items, public.drivers, public.reviews",
+
+    "topic.prefix": "cdc",
+    "snapshot.isolation.mode": "repeatable_read",
+    "heartbeat.interval.ms": "5000",
+    "slot.max.retries": "5",
+    "slot.retry.delay.ms": "10000",
+    "decimal.handling.mode": "double",
+    "time.precision.mode": "connect"
+  }
+}

@@ -1,0 +1,6 @@
+config/keystore.jks
+.env
+.vault-keys.enb
+
+scripts/
+.env
